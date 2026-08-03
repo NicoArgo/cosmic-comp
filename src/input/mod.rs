@@ -1063,7 +1063,15 @@ impl State {
                                 natural_scroll = natural;
                             }
                             activate_action = match gesture_state.fingers {
-                                3 => None, // TODO: 3 finger gestures
+                                // Three fingers act once per gesture rather
+                                // than following the fingers, so they are
+                                // dispatched further down, past a distance
+                                // threshold. Four stays on workspaces, which is
+                                // what upstream does and what muscle memory
+                                // already expects.
+                                3 => gesture_state.direction.and_then(|direction| {
+                                    gestures::three_finger_action(direction, natural_scroll)
+                                }),
                                 4 => {
                                     if self.common.config.cosmic_conf.workspaces.workspace_layout
                                         == WorkspaceLayout::Horizontal
@@ -1109,6 +1117,13 @@ impl State {
                             };
 
                             gesture_state.action = activate_action;
+                            // One-shot actions are dispatched below, once the
+                            // swipe is long enough to be deliberate — not here,
+                            // where the direction has only just been guessed
+                            // from the first pixel of movement.
+                            if activate_action.is_some_and(|action| !action.is_continuous()) {
+                                activate_action = None;
+                            }
                         }
 
                         match gesture_state.action {
@@ -1119,6 +1134,12 @@ impl State {
                                     gesture_state.delta,
                                     matches!(x, SwipeAction::NextWorkspace),
                                 )
+                            }
+                            Some(action) if !gesture_state.triggered => {
+                                if gesture_state.delta.abs() >= gestures::DISCRETE_THRESHOLD {
+                                    gesture_state.triggered = true;
+                                    activate_action = Some(action);
+                                }
                             }
                             _ => {}
                         }

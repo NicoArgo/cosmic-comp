@@ -12,17 +12,75 @@ pub struct SwipeEvent {
     timestamp: Duration,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwipeAction {
     NextWorkspace,
     PrevWorkspace,
+    /// Focus the window to the right / to the left of the current one.
+    NextWindow,
+    PrevWindow,
+    /// Open the workspace overview.
+    Overview,
+    /// Put every window away, or bring back the ones that were put away.
+    ShowDesktop,
 }
+
+impl SwipeAction {
+    /// Whether the action follows the fingers continuously.
+    ///
+    /// Workspace switching is animated along with the swipe and committed when
+    /// the fingers lift. Everything else happens once, at a point in the
+    /// gesture, and must not be re-fired on every motion event.
+    pub fn is_continuous(self) -> bool {
+        matches!(self, Self::NextWorkspace | Self::PrevWorkspace)
+    }
+}
+
+/// What a three-finger swipe in `direction` means.
+///
+/// Sideways follows `natural_scroll`, because moving between windows is moving
+/// along a row and reads like dragging content. Up and down deliberately do
+/// not: they are two unrelated commands rather than two ends of an axis, and
+/// swapping "show me everything" with "hide everything" because of a scrolling
+/// preference would be baffling.
+pub fn three_finger_action(direction: Direction, natural_scroll: bool) -> Option<SwipeAction> {
+    Some(match direction {
+        Direction::Left => {
+            if natural_scroll {
+                SwipeAction::NextWindow
+            } else {
+                SwipeAction::PrevWindow
+            }
+        }
+        Direction::Right => {
+            if natural_scroll {
+                SwipeAction::PrevWindow
+            } else {
+                SwipeAction::NextWindow
+            }
+        }
+        Direction::Up => SwipeAction::Overview,
+        Direction::Down => SwipeAction::ShowDesktop,
+    })
+}
+
+/// How far a swipe must travel before a one-shot action fires, in the same
+/// units as the accumulated delta.
+///
+/// The direction is decided from the very first motion event, which can be a
+/// pixel or two. Acting there would turn a resting hand into a window switch,
+/// so a one-shot action waits until the gesture is unmistakably a gesture.
+pub const DISCRETE_THRESHOLD: f64 = 60.0;
 
 #[derive(Debug, Clone)]
 pub struct GestureState {
     pub fingers: u32,
     pub direction: Option<Direction>,
     pub action: Option<SwipeAction>,
+    /// Whether a one-shot action has already fired for this gesture. Without
+    /// it, holding past the threshold would repeat the action on every motion
+    /// event for as long as the fingers keep moving.
+    pub triggered: bool,
     pub delta: f64,
     // Delta tracking inspired by Niri (GPL-3.0) https://github.com/YaLTeR/niri/tree/v0.1.3
     pub history: VecDeque<SwipeEvent>,
@@ -34,6 +92,7 @@ impl GestureState {
             fingers,
             direction: None,
             action: None,
+            triggered: false,
             delta: 0.0,
             history: VecDeque::new(),
         }
@@ -169,5 +228,60 @@ impl RubberBand {
         let clamped = x.clamp(min, max);
         let diff = (x - clamped).abs();
         self.derivative(diff)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sideways_swipes_follow_natural_scrolling() {
+        assert_eq!(
+            three_finger_action(Direction::Right, false),
+            Some(SwipeAction::NextWindow)
+        );
+        assert_eq!(
+            three_finger_action(Direction::Right, true),
+            Some(SwipeAction::PrevWindow)
+        );
+        assert_eq!(
+            three_finger_action(Direction::Left, false),
+            Some(SwipeAction::PrevWindow)
+        );
+        assert_eq!(
+            three_finger_action(Direction::Left, true),
+            Some(SwipeAction::NextWindow)
+        );
+    }
+
+    #[test]
+    fn vertical_swipes_are_not_mirrored_by_natural_scrolling() {
+        // Guards a plausible "fix": someone noticing the asymmetry above and
+        // making up and down invert too. Overview and show-desktop are separate
+        // commands, not two ends of an axis — flipping them under a scrolling
+        // preference would hide every window when the user asked to see them.
+        for natural_scroll in [false, true] {
+            assert_eq!(
+                three_finger_action(Direction::Up, natural_scroll),
+                Some(SwipeAction::Overview)
+            );
+            assert_eq!(
+                three_finger_action(Direction::Down, natural_scroll),
+                Some(SwipeAction::ShowDesktop)
+            );
+        }
+    }
+
+    #[test]
+    fn only_workspace_switching_follows_the_fingers() {
+        // Everything else fires once, past a threshold. Getting this backwards
+        // would repeat the action on every motion event of the swipe.
+        assert!(SwipeAction::NextWorkspace.is_continuous());
+        assert!(SwipeAction::PrevWorkspace.is_continuous());
+        assert!(!SwipeAction::NextWindow.is_continuous());
+        assert!(!SwipeAction::PrevWindow.is_continuous());
+        assert!(!SwipeAction::Overview.is_continuous());
+        assert!(!SwipeAction::ShowDesktop.is_continuous());
     }
 }

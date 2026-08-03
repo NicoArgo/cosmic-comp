@@ -127,6 +127,35 @@ impl State {
                     &mut self.common.workspace_state.update(),
                 );
             }
+            SwipeAction::NextWindow | SwipeAction::PrevWindow => {
+                let focus = if action == SwipeAction::NextWindow {
+                    FocusDirection::Right
+                } else {
+                    FocusDirection::Left
+                };
+                let result = self.common.shell.read().next_focus(focus, seat);
+                if let FocusResult::Some(target) = result {
+                    Shell::set_focus(self, Some(&target), seat, None, true);
+                }
+                // Nothing to focus that way is the end of it. The keyboard
+                // shortcut falls through to changing workspace here, but a
+                // three-finger swipe must not: four fingers is the workspace
+                // gesture, and having three do it at the edge of the layout
+                // would be indistinguishable from having miscounted fingers.
+            }
+
+            SwipeAction::Overview => {
+                self.spawn_system_action(shortcuts::action::System::WorkspaceOverview);
+            }
+
+            SwipeAction::ShowDesktop => {
+                // POP Flow's own applet, which also owns the panel button for
+                // this. Going through the binary rather than reimplementing it
+                // here keeps one definition of "which windows did I put away",
+                // shared with the button through its state file.
+                self.spawn_command("cosmic-applet-show-desktop --toggle".to_string());
+            }
+
             SwipeAction::PrevWorkspace => {
                 let _ = to_previous_workspace(
                     &mut self.common.shell.write(),
@@ -1038,6 +1067,18 @@ impl State {
 
             // Do nothing
             Action::Disable => (),
+        }
+    }
+
+    /// Run whatever the user has configured for a system action.
+    ///
+    /// These are commands rather than compositor internals, so a gesture that
+    /// opens the overview or the app library reuses exactly what the matching
+    /// keyboard shortcut runs, including any customization.
+    pub fn spawn_system_action(&mut self, system: shortcuts::action::System) {
+        match self.common.config.system_actions.get(&system).cloned() {
+            Some(command) => self.spawn_command(command),
+            None => warn!("no command configured for system action {system:?}"),
         }
     }
 
