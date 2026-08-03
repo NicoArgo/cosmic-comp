@@ -14,3 +14,6 @@ vendor.tar
 .vscode
 *.log
 /result
+
+# POP Flow: system-binary backups made by install.sh — never commit these.
+*.orig
