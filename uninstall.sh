@@ -16,10 +16,12 @@ cd "$(dirname "$0")"
 
 [ -f cosmic-comp.orig ] || { echo "No backup (cosmic-comp.orig) found."; exit 1; }
 
-# Remove the auto-reapply golden copy if one was placed for cosmic-comp.
-if [ -f /usr/local/lib/pop-flow/cosmic-comp ]; then
-    echo "==> Removing auto-reapply golden copy (needs sudo)..."
-    sudo rm -f /usr/local/lib/pop-flow/cosmic-comp
+# Turn off auto-reapply first, or the next package operation would re-patch the
+# binary right after we restore the original. Delegating to the script that owns
+# those paths rather than repeating them: this used to remove only the golden
+# copy, leaving a root-owned APT hook behind for good.
+if [ -x ./remove-auto-reapply.sh ]; then
+    ./remove-auto-reapply.sh
 fi
 
 echo "==> Restoring original /usr/bin/cosmic-comp (needs sudo)..."
