@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{
+    input::InputBackendId,
     shell::Shell,
     state::{BackendData, State},
     utils::prelude::OutputExt,
@@ -13,8 +14,11 @@ use cosmic_config::{ConfigGet, CosmicConfigEntry};
 use cosmic_settings_config::window_rules::ApplicationException;
 use cosmic_settings_config::{Shortcuts, shortcuts, window_rules};
 use serde::{Deserialize, Serialize};
-use smithay::utils::{Clock, Monotonic};
 use smithay::wayland::xdg_activation::XdgActivationState;
+use smithay::{
+    backend::input::InputTime,
+    utils::{Clock, Monotonic},
+};
 pub use smithay::{
     backend::input::{self as smithay_input, KeyState},
     input::keyboard::{Keysym, ModifiersState, keysyms as KeySyms},
@@ -45,8 +49,8 @@ mod types;
 use cosmic::config::CosmicTk;
 pub use cosmic_comp_config::EdidProduct;
 use cosmic_comp_config::{
-    ActivationPolicy, AppearanceConfig, CosmicCompConfig, KeyboardConfig, TileBehavior, XkbConfig,
-    XwaylandDescaling, XwaylandEavesdropping, ZoomConfig,
+    ActivationPolicy, AppearanceConfig, CosmicCompConfig, DecorationPreference, KeyboardConfig,
+    TileBehavior, XkbConfig, XwaylandDescaling, XwaylandEavesdropping, ZoomConfig,
     input::{DeviceState as InputDeviceState, InputConfig, TouchpadOverride},
     output::comp::{
         OutputConfig, OutputInfo, OutputState, OutputsConfig, TransformDef, load_outputs,
@@ -168,7 +172,7 @@ pub enum ColorFilter {
 }
 
 impl Config {
-    pub fn load(loop_handle: &LoopHandle<'_, State>) -> Config {
+    pub fn load(loop_handle: &LoopHandle<'_, State>, kiosk_mode: bool) -> Config {
         let config = cosmic_config::Config::new("com.system76.CosmicComp", 1).unwrap();
         let source = cosmic_config::calloop::ConfigWatchSource::new(&config).unwrap();
         loop_handle
@@ -244,40 +248,48 @@ impl Config {
 
         // Source key bindings from com.system76.CosmicSettings.Shortcuts
         let settings_context = shortcuts::context().expect("Failed to load shortcuts config");
-        let system_actions = shortcuts::system_actions(&settings_context);
-        let shortcuts = shortcuts::shortcuts(&settings_context);
+        let mut system_actions = Default::default();
+        let mut shortcuts = Default::default();
+        // Kiosk mode disables shortcuts
+        if !kiosk_mode {
+            system_actions = shortcuts::system_actions(&settings_context);
+            shortcuts = shortcuts::shortcuts(&settings_context);
 
-        // Listen for updates to the keybindings config.
-        match cosmic_config::calloop::ConfigWatchSource::new(&settings_context) {
-            Ok(source) => {
-                if let Err(err) = loop_handle.insert_source(source, |(config, keys), (), state| {
-                    for key in keys {
-                        match key.as_str() {
-                            // Reload the keyboard shortcuts config.
-                            "custom" | "defaults" => {
-                                state.common.config.shortcuts = shortcuts::shortcuts(&config);
+            // Listen for updates to the keybindings config.
+            match cosmic_config::calloop::ConfigWatchSource::new(&settings_context) {
+                Ok(source) => {
+                    if let Err(err) =
+                        loop_handle.insert_source(source, |(config, keys), (), state| {
+                            for key in keys {
+                                match key.as_str() {
+                                    // Reload the keyboard shortcuts config.
+                                    "custom" | "defaults" => {
+                                        state.common.config.shortcuts =
+                                            shortcuts::shortcuts(&config);
+                                    }
+
+                                    "system_actions" => {
+                                        state.common.config.system_actions =
+                                            shortcuts::system_actions(&config);
+                                    }
+
+                                    _ => (),
+                                }
                             }
-
-                            "system_actions" => {
-                                state.common.config.system_actions =
-                                    shortcuts::system_actions(&config);
-                            }
-
-                            _ => (),
-                        }
+                        })
+                    {
+                        warn!(
+                            ?err,
+                            "Failed to watch com.system76.CosmicSettings.Shortcuts config"
+                        );
                     }
-                }) {
-                    warn!(
-                        ?err,
-                        "Failed to watch com.system76.CosmicSettings.Shortcuts config"
-                    );
                 }
-            }
-            Err(err) => warn!(
-                ?err,
-                "failed to create config watch source for com.system76.CosmicSettings.Shortcuts"
-            ),
-        };
+                Err(err) => warn!(
+                    ?err,
+                    "failed to create config watch source for com.system76.CosmicSettings.Shortcuts"
+                ),
+            };
+        }
 
         let window_rules_context =
             window_rules::context().expect("Failed to load window rules config");
@@ -537,7 +549,13 @@ impl Config {
                     primary.config_mut().xwayland_primary = true;
                 }
             }
-            for output in outputs.iter().filter(|o| o.mirroring().is_none()) {
+            // sort by connector name for a deterministic layout independent of hotplug order
+            let mut sorted_outputs = outputs
+                .iter()
+                .filter(|o| o.mirroring().is_none())
+                .collect::<Vec<_>>();
+            sorted_outputs.sort_by_key(|o| o.name());
+            for output in sorted_outputs {
                 {
                     let mut config = output.config_mut();
                     config.position = (w, 0);
@@ -769,13 +787,12 @@ pub fn change_modifier_state(
     const X11_KEYCODE_OFFSET: u32 = 8;
 
     let mut input = |key_state, scan_code| {
-        let time = state.common.clock.now().as_millis();
         let _ = keyboard.input(
             state,
             smithay_input::Keycode::new(scan_code + X11_KEYCODE_OFFSET),
             key_state,
             SERIAL_COUNTER.next_serial(),
-            time,
+            InputTime::now(),
             |_, _, _| smithay::input::keyboard::FilterResult::<()>::Forward,
         );
     };
@@ -818,6 +835,29 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                             const CAPSLOCK_SCANCODE: u32 = 58;
                             change_modifier_state(&keyboard, CAPSLOCK_SCANCODE, state);
                         }
+                    }
+                }
+                let ei_connections = state
+                    .common
+                    .ei_keyboard_source
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for conn in &ei_connections {
+                    state.release_ei_keyboard(conn);
+                    state.clear_input_source_state(&InputBackendId::Ei(conn.clone()));
+                }
+                for ei_seat in state.common.ei_seats.values() {
+                    if let Err(err) =
+                        ei_seat.add_keyboard("virtual keyboard", xkb_config_to_wl(&value))
+                    {
+                        warn!(?err, "Failed to update libei keyboard keymap");
+                    }
+                }
+                if !state.common.ei_seats.is_empty() {
+                    let seat = state.common.shell.read().seats.last_active().clone();
+                    if let Some(keyboard) = seat.get_keyboard() {
+                        state.broadcast_ei_keyboard_modifiers(&keyboard);
                     }
                 }
                 state.common.config.cosmic_conf.xkb_config = value;
@@ -947,6 +987,10 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                     }
                 }
             }
+            "cursor_shake_to_find" => {
+                let new = get_config::<bool>(&config, "cursor_shake_to_find");
+                state.common.config.cosmic_conf.cursor_shake_to_find = new;
+            }
             "cursor_hide_timeout" => {
                 let new = get_config::<Option<u32>>(&config, "cursor_hide_timeout");
                 if new != state.common.config.cosmic_conf.cursor_hide_timeout {
@@ -970,6 +1014,13 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                 let new = get_config::<ActivationPolicy>(&config, "activation_policy");
                 if new != state.common.config.cosmic_conf.activation_policy {
                     state.common.config.cosmic_conf.activation_policy = new;
+                }
+            }
+            "decoration_preference" => {
+                let new = get_config::<DecorationPreference>(&config, "decoration_preference");
+                if new != state.common.config.cosmic_conf.decoration_preference {
+                    state.common.config.cosmic_conf.decoration_preference = new;
+                    state.update_decorations();
                 }
             }
             _ => {}
